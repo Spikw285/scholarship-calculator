@@ -1,0 +1,12 @@
+[tool.poetry]
+name = "scholarship-calculator"
+version = "0.1.0"
+description = "Web service to calculate target grades and helpful combinations"
+
+
+[tool.black]
+line-length = 88
+
+
+[tool.isort]
+profile = "black"
