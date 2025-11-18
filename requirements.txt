@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+alembic
+python-dotenv
+pytest
+httpx
+black
+isort
+flake8
+pre-commit
