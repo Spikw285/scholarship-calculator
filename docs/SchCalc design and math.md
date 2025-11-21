@@ -71,8 +71,8 @@ Let's say that student A has course B and this course has the following grading 
 	Overall grade for 2 assessment - 100%.
 - Final Exam - 100%
 *Cumulative overall grade for the course* = 
-$0.3\times{1^{\text{st}}}\text{Att}+0.3\times{2^{\text{nd}}}\text{Att}+0.4\times\text{Final}=100$
-Then, student has passed RegMid with 70% of 100, and thenpasses RegEnd with 85% out of 100. Then, RegTerm is calculated
+$0.3\times{1^{\text{st}}}\text{Att}+0.3\times{2^{\text{nd}}}\text{Att}+0.4\times\text{Final}=100$ 
+Then, student has passed RegMid with 70% of 100, and then passes RegEnd with 85% out of 100. Then, RegTerm is calculated
 $\text{RegTerm}=\frac{\text{RegMid}+\text{RegEnd}}{2}=\frac{70+85}{2}=\frac{155}{2}=77.5$
 And then student passes Final exam at 60%, whereas RegTotal is calculated
 $\text{RegTotal}=\text{RegTerm}\times0.6+\text{Final}\times.4=77.5*.6+60*.4=46.5+24=70.5$
