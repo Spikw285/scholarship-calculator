@@ -1,10 +1,13 @@
+import logging
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app import schemas
 from backend.app.calculations import GradeCalculator
 
-app = FastAPI(title="Scholarship Calculator API", version="0.1")
+logger = logging.getLogger(__name__)
+app = FastAPI(title="Scholarship Calculator API", version="0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,6 +22,7 @@ calc = GradeCalculator()
 @app.post("/required_final", response_model=schemas.RequiredFinalResponse)
 def required_final(req: schemas.RequiredFinalRequest):
     """
+    Returns required final grade for a given register term and target
     Request body must be:
     {
         "reg_term": a (e.g., 77.5),
@@ -29,15 +33,21 @@ def required_final(req: schemas.RequiredFinalRequest):
     # basic validation
     if req.weights.term + req.weights.final == 0:
         raise HTTPException(status_code=400, detail="weights must not sum to zero")
-    res = calc.required_final(
-        reg_term=req.reg_term,
-        target=req.target,
-        term_weight=req.weights.term,
-        final_weight=req.weights.final,
-        clip=True,
-    )
-    if res is None:
-        # invalid input, return structured error
-        raise HTTPException(status_code=400, detail="invalid numeric input")
-    response = {"required_final": res}
-    return response
+    try:
+        min_final = (
+            req.min_final if getattr(req, "min_final", None) is not None else 0.0
+        )
+        result = calc.required_final_with_min(
+            req.reg_term,
+            req.target,
+            req.weights.term,
+            req.weights.final,
+            min_final,
+            clip=True,
+        )
+        return result
+    except Exception as e:
+        logger.exception("Error in /required_final: %s", e)
+        raise HTTPException(
+            status_code=400, detail=f"Error computing required_final: {str(e)}"
+        )

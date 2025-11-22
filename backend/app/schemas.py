@@ -12,10 +12,15 @@ class RequiredFinalRequest(BaseModel):
     reg_term: float
     target: float
     weights: Optional[Weights] = Weights()
+    min_final: Optional[float] = 0.0
 
 
 class RequiredFinalResponse(BaseModel):
-    required_final: float
+    raw: Optional[float] = None
+    required_final: Optional[float] = None
+    feasible: Optional[bool] = None
+    required_regterm_if_min_final: Optional[float] = None
+    note: Optional[str] = None
 
 
 class Component(BaseModel):

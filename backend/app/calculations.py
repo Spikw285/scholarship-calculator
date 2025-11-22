@@ -14,18 +14,42 @@ def _ensure_weights_sum_to_one(
 ) -> List[Dict[str, Any]]:
     if not components:
         return []
-    total = sum(float(component.get("weight", 0) or 0) for component in components)
+    total = sum(float(c.get("weight", 0) or 0) for c in components)
     if total <= 0:
+        n = len(components)
         logger.warning(
-            "Component total weight == 0, assigning equal weights to %d components",
+            "Component total weight == 0, assigning equal weights to equalcomponents"
+        )
+        return [{**c, "weight": 1.0 / n} for c in components]
+    return [{**c, "weight": float(c.get("weight", 0)) / total} for c in components]
+
+
+def compute_regterm_from_components(
+    scores: List[float], components: List[Dict[str, Any]]
+) -> Optional[float]:
+    """
+    Compute RegTerm as a weighted sum of scores (weights normalized)
+    """
+    if not components:
+        logger.warning("No components provided")
+        return None
+    components = _ensure_weights_sum_to_one(components)
+    if len(scores) != len(components):
+        logger.error(
+            "Scores length (%d) differs from components length (%d)",
+            len(scores),
             len(components),
         )
-        num = len(components)
-        return [{**component, "weight": 1.0 / num} for component in components]
-    return [
-        {**component, "weight": float(component.get("weight", 0) / total)}
-        for component in components
-    ]
+        return None
+    try:
+        total = 0.0
+        for s, c in zip(scores, components):
+            total += float(s) * float(c["weight"])
+    except Exception as e:
+        logger.error("Error computing regterm from components: %s", e)
+        return None
+    logger.debug("Computed regterm %.4f from components", total)
+    return total
 
 
 def required_final_score_struct(
@@ -34,6 +58,11 @@ def required_final_score_struct(
     term_weight: float,
     final_weight: float,
 ) -> Dict[str, Any]:
+    """
+    Compute raw required final using formula:
+        raw = (target - reg_term * term_weight) / final_weight
+    Return structure with raw, clipped and feasible flags
+    """
     logger.debug(
         "required_final_score_struct called: reg_term=%s, target=%s, term_weight=%s, final_weight=%s",
         reg_term,
@@ -47,16 +76,9 @@ def required_final_score_struct(
         term_weight = float(term_weight)
         final_weight = float(final_weight)
     except ValueError as e:
-        logger.exception("Invalid numeric input to required_final_score_struct: %s", e)
+        logger.exception("Invalid numeric input: %s", e)
         return {"raw": None, "clipped": None, "feasible": False}
 
-    if not (0.0 <= reg_term <= 100.0 and 0.0 <= target <= 100.0):
-        logger.info(
-            "Percent inputs out of range (0..100): reg_term=%s, target=%s",
-            reg_term,
-            target,
-        )
-        return {"raw": None, "clipped": None, "feasible": False}
     if math.isclose(final_weight, 0.0):
         logger.error(
             "final_weight is zero (division by zero). term_weight=%s final_weight=%s",
@@ -77,32 +99,11 @@ def required_final_score_struct(
     return {"raw": raw, "clipped": clipped, "feasible": feasible}
 
 
-def compute_regterm_from_components(
-    scores: List[float], components: List[Dict[str, Any]]
-) -> Optional[float]:
-    if not components:
-        logger.warning("No components provided")
-        return None
-    components = _ensure_weights_sum_to_one(components)
-    if len(scores) != len(components):
-        logger.error(
-            "Scores length (%d) differs from components length (%d)",
-            len(scores),
-            len(components),
-        )
-        return None
-    try:
-        total = 0.0
-        for score, component in zip(scores, components):
-            total += float(score) * float(component["weight"])
-    except Exception as e:
-        logger.error("Error computing regterm from components: %s", e)
-        return None
-    logger.debug("Computed regterm %.4f from components", total)
-    return total
-
-
 class GradeCalculator:
+    """
+    Encapsulates grade-related calculations and strategies
+    """
+
     def __init__(self, assume_missing_zero: bool = True, round_step: float = 0.5):
         self.assume_missing_zero = assume_missing_zero
         self.round_step = float(round_step)
@@ -130,6 +131,7 @@ class GradeCalculator:
         return round(round(x / step) * step, 6)
 
     # core utils
+
     def required_final(
         self,
         reg_term: float,
@@ -138,6 +140,9 @@ class GradeCalculator:
         final_weight: float = 0.4,
         clip: bool = True,
     ) -> Optional[float]:
+        """
+        Backward-compatible helper: simple clipped required final (no min_final logic).
+        """
         r = required_final_score_struct(reg_term, target, term_weight, final_weight)
         if r["raw"] is None:
             return None
@@ -165,6 +170,109 @@ class GradeCalculator:
         clipped = max(0.0, min(100.0, raw))
         feasible = raw <= 100 + 1e-9
         return {"raw": raw, "clipped": clipped, "feasible": feasible}
+
+    def required_final_with_min(
+        self,
+        reg_term: float,
+        target: float,
+        term_weight: float = 0.6,
+        final_weight: float = 0.4,
+        min_final: float = 0.0,
+        clip: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Compute required final considering a university minimum final threshold (min_final).
+        Returns:
+          {
+            "raw": float or None,
+            "required_final": float,
+            "feasible": bool,
+            "required_regterm_if_min_final": float or None,
+            "note": str or None
+          }
+        """
+        out = {
+            "raw": None,
+            "required_final": None,
+            "feasible": False,
+            "required_regterm_if_min_final": None,
+            "note": None,
+        }
+
+        struct = required_final_score_struct(
+            reg_term, target, term_weight, final_weight
+        )
+        raw = struct.get("raw")
+        out["raw"] = raw
+
+        if raw is None:
+            out["note"] = "Invalid numeric input"
+            return out
+
+        clipped = max(0.0, min(100.0, float(raw)))
+
+        # Case A: raw is ok and >= min_final
+        if raw >= float(min_final) and raw <= 100.0 + 1e-9:
+            out["required_final"] = clipped if clip else raw
+            out["feasible"] = True
+            out["note"] = None
+            return out
+
+        # Case B: raw < min_final -> compute necessary RegTerm if final is min_final
+        if raw < float(min_final):
+            regterm_struct = self.required_regterm_for_final_cap(
+                target, float(min_final), term_weight, final_weight
+            )
+            required_regterm = regterm_struct.get("raw")
+            out["required_regterm_if_min_final"] = required_regterm
+            out["required_final"] = float(min_final) if clip else float(raw)
+
+            # If student's current reg_term already meets required_regterm, it's feasible
+            try:
+                rt = float(reg_term)
+            except Exception:
+                rt = None
+
+            if (
+                required_regterm is not None
+                and rt is not None
+                and rt >= float(required_regterm) - 1e-9
+            ):
+                out["feasible"] = True
+                out["note"] = (
+                    f"University requires Final >= {min_final}%. "
+                    "Your current RegTerm is sufficient; no extra term work required."
+                )
+            else:
+                feasible_under_min = (
+                    required_regterm is not None and required_regterm <= 100.0 + 1e-9
+                )
+                out["feasible"] = feasible_under_min
+                if feasible_under_min:
+                    out["note"] = (
+                        f"Final cannot be below {min_final}%. To reach target, you need RegTerm "
+                        f">= {round(required_regterm, 2)} (currently {reg_term})."
+                    )
+                else:
+                    out["note"] = (
+                        f"Even with Final = {min_final}% or Final = 100%, the target is unreachable. "
+                        "Consider lowering target or contacting instructor."
+                    )
+            return out
+
+        # Case C: raw > 100
+        if raw > 100.0:
+            out["required_final"] = 100.0
+            out["feasible"] = False
+            out["note"] = (
+                "Even 100% on Final is insufficient; increase RegTerm or lower target."
+            )
+            return out
+
+        # Fallback
+        out["required_final"] = clipped
+        out["feasible"] = struct.get("feasible", False)
+        return out
 
     # effort metrics
     def compute_efforts(
