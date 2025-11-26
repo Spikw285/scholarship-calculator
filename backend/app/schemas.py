@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -26,22 +26,31 @@ class RequiredFinalResponse(BaseModel):
 class Component(BaseModel):
     name: str
     weight: float
+    score: Optional[float] = None  # known score, or null if unknown
+    current: Optional[float] = None  # current score (for effort calculations)
+    min_score: Optional[float] = 0.0
+    max_score: Optional[float] = 100.0
 
 
 class CombinationsRequest(BaseModel):
-    target: float
-    weights: Weights = Weights()
     components: List[Component]
-    current_scores: Optional[List[float]] = None
-    final_cap: Optional[float] = 100
-    step: float = 5.0
-    max_results: int = 30
+    target: float
+    strategy: Optional[str] = "lp"  # either "lp" or "bruteforce"
+    step: float = 1.0  # used for bruteforce grid step in percent
+    max_results: Optional[int] = 20  # how many alternatives to return for bruteforce
+    costs: Optional[Dict[str, float]] = (
+        None  # optional per-component cost-map (name->cost)
+    )
+    objective: Optional[str] = "sum"  # 'sum' or 'minmax' for LP'
 
 
-class CombinationOut(BaseModel):
-    scores: List[float]
-    effort: float
+class CombinationResult(BaseModel):
+    scores: Dict[str, float]
+    efforts: Dict[str, float]
+    feasible: bool
+    note: Optional[str] = None
 
 
 class CombinationsResponse(BaseModel):
-    results: List[CombinationOut]
+    strategy: str
+    results: List[CombinationResult]

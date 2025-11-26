@@ -59,8 +59,8 @@ def required_final_score_struct(
     final_weight: float,
 ) -> Dict[str, Any]:
     """
-    Compute raw required final using formula:
-        raw = (target - reg_term * term_weight) / final_weight
+    Compute raw required final using formula:\n
+    `raw = (target - reg_term * term_weight) / final_weight`\n
     Return structure with raw, clipped and feasible flags
     """
     logger.debug(
@@ -129,6 +129,22 @@ class GradeCalculator:
     def _round(self, x: float) -> float:
         step = self.round_step
         return round(round(x / step) * step, 6)
+
+    def _normalize_components(self, components: List[Dict[str, Any]]):
+        """
+        Normalize weights and produce lists of known/unknown components\n
+        :returns: (components, known_sum, unknowns_list)
+        """
+        comps = _ensure_weights_sum_to_one(components)
+        known_sum = 0.0
+        unknowns = []
+        for c in comps:
+            score = c.get("score")
+            if score is None:
+                unknowns.append(c)
+            else:
+                known_sum += float(score) * c["weight"]
+        return comps, known_sum, unknowns
 
     # core utils
 
@@ -281,6 +297,9 @@ class GradeCalculator:
         current_scores: Optional[List[Optional[float]]] = None,
         components: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, float]:
+        """
+        Function for calculating the efforts for any given subject
+        """
         cur = current_scores or [0.0] * len(candidate_scores)
         cur = [0.0 if v is None else float(v) for v in cur]
         diffs = [max(0.0, float(s) - float(c)) for s, c in zip(candidate_scores, cur)]
@@ -288,15 +307,18 @@ class GradeCalculator:
         maximum = max(diffs) if diffs else 0.0
         l2 = math.sqrt(sum(d * d for d in diffs))
         weighted_total = None
-        if components:
+        if components and len(components) > 0:
             comps = _ensure_weights_sum_to_one(components)
-            weighted_total = sum(d * comps[i]["weight"] for i, d in enumerate(diffs))
+            if len(comps) == len(diffs):
+                weighted_total = sum(
+                    d * comps[i]["weight"] for i, d in enumerate(diffs)
+                )
         return {
             "L1": round(total, 6),
             "Linf": round(maximum, 6),
             "L2": round(l2, 6),
             "weighted_L1": (
-                round(weighted_total, 6) if weighted_total is not None else None
+                round(weighted_total, 6) if weighted_total is not None else 0.0
             ),
         }
 
@@ -376,14 +398,13 @@ class GradeCalculator:
     ) -> Dict[str, Any]:
         """
         objective: 'sum' -> minimize sum(costs*increases)
-                   'minmax' -> minimize t 9max single increase)
-        Requires scipy; if absent, returns {"available": False, "reason": "scipy not installed"}
+                   'minmax' -> minimize t 9max single increase).
+        Requires scipy; if absent, returns an error indicating that scipy was not installed.
         """
         try:
             from scipy.optimize import linprog
-        except ImportError:
-            logger.exception("scipy not available for LP since it's not imported")
-            return {"available": False, "reason": "scipy not installed"}
+        except Exception:
+            raise ImportError("scipy not available for LP since it's not imported")
 
         components = _ensure_weights_sum_to_one(components)
         n = len(components)
@@ -513,3 +534,221 @@ class GradeCalculator:
         # sort by L1 then Linf
         results.sort(key=lambda r: (r["efforts"]["L1"], r["efforts"]["Linf"]))
         return {"results": results[:max_results]}
+
+    def solve_combinations(
+        self,
+        components: List[Dict[str, Any]],
+        target: float,
+        strategy: str = "lp",
+        step: float = 1.0,
+        max_results: int = 20,
+        costs: Optional[Dict[str, float]] = None,
+        objective: str = "sum",
+    ) -> Dict[str, Any]:
+        """
+        Solve for unknown component scores to reach target.\n
+        Strategies: "lp" or "bruteforce".\n
+        Returns dict with 'strategy' and 'results' (list).
+        """
+        comps, known_sum, unknowns = self._normalize_components(components)
+        if not comps:
+            # Empty components list
+            return {"strategy": strategy, "error": "components list cannot be empty"}
+        if not unknowns:
+            # nothing to solve; compute total and return
+            total = known_sum
+            note = "No unknown components"
+            # Compute efforts with components to ensure weighted_L1 is calculated
+            efforts = self.compute_efforts(
+                [c.get("score", 0.0) for c in comps],
+                [c.get("current", c.get("score", 0.0)) for c in comps],
+                comps,
+            )
+            return {
+                "strategy": strategy,
+                "results": [
+                    {
+                        "scores": {c["name"]: c.get("score", 0.0) for c in comps},
+                        "efforts": efforts,
+                        "feasible": total >= target - 1e-9,
+                        "note": note,
+                    }
+                ],
+            }
+        # Build helper maps
+        name_to_index = {c["name"]: i for i, c in enumerate(comps)}
+        unknown_indices = [name_to_index[c["name"]] for c in unknowns]
+        current_vals = [
+            c.get("current", (c.get("score") if c.get("score") is not None else 0.0))
+            for c in comps
+        ]
+
+        if strategy == "lp":
+            # Try LP using scipy
+            try:
+                from scipy.optimize import linprog
+            except Exception:
+                # fallback to bruteforce if scipy is not available
+                raise ImportError(
+                    "scipy not installed; install scipy or use 'bruteforce'"
+                )
+
+            n_unknown = len(unknowns)
+            # variable ordering: s_j (unknown scores)
+            # bounds for s_j: [min_score, max_score]
+            bounds = []
+            for u in unknowns:
+                lo = max(0.0, float(u.get("min_score", 0.0)))
+                hi = min(100.0, float(u.get("max_score", 100.0)))
+                bounds.append((lo, hi))
+
+            # Build inequality: - sum(weights_unknown * s_j) <= -(target - known_sum)
+            A_ub = []
+            b_ub = []
+            A_ub.append([-u["weight"] for u in unknowns])  # mapping unknowns order
+            b_ub.append(-(float(target) - float(known_sum)))
+
+            # objective: minimize sum(cost_j * u_j) where u_j >= s_j - current_j
+            # To linearize absolute increases, introduce uplus variables. We'll implement:
+            # variables: s_0..s_{m-1}, uplus_0..uplus_{m-1}
+            # minimize sum(costs * uplus)
+            # constraints: uplus_j >= s_j - current_j  -> -uplus_j + s_j <= current_j
+            # and uplus_j >= 0
+            m = n_unknown
+            if costs is None:
+                costs_list = [1.0] * m
+            else:
+                # map by name
+                costs_list = [float(costs.get(u["name"], 1.0)) for u in unknowns]
+
+            c_obj = [0.0] * m + costs_list  # objective vector length 2m
+
+            # Build A_ub rows for uplus constraints and the main target constraint
+            A_ub_full = []
+            b_ub_full = []
+
+            # main target constraint (unknown contributions)
+            row_main = [-u["weight"] for u in unknowns] + [0.0] * m
+            A_ub_full.append(row_main)
+            b_ub_full.append(-(float(target) - float(known_sum)))
+
+            # uplus constraints: -uplus + s <= current_j
+            for j in range(m):
+                row = [0.0] * (2 * m)
+                row[j] = 1.0  # s_j
+                row[m + j] = -1.0  # -uplus_j
+                A_ub_full.append(row)
+                cur_j = float(
+                    unknowns[j].get("current", unknowns[j].get("min_score", 0.0))
+                )
+                b_ub_full.append(cur_j)
+
+            bounds_full = bounds + [(0.0, None) for _ in range(m)]
+
+            res = linprog(
+                c=c_obj,
+                A_ub=A_ub_full,
+                b_ub=b_ub_full,
+                bounds=bounds_full,
+                method="highs",
+            )
+            if not res.success:
+                return {"strategy": "lp", "success": False, "reason": res.message}
+
+            # Handle both numpy arrays and lists
+            x_vals = res.x[:m]
+            if hasattr(x_vals, "tolist"):
+                s_vals = x_vals.tolist()
+            else:
+                s_vals = (
+                    list(x_vals)
+                    if isinstance(x_vals, (list, tuple))
+                    else [float(x_vals[i]) for i in range(m)]
+                )
+            # compose full scores mapping
+            scores_map = {}
+            for i, c in enumerate(comps):
+                if c["score"] is None:
+                    # get s from s_vals in order of unknowns
+                    idx = unknown_indices.index(i)
+                    scores_map[c["name"]] = round(max(0.0, min(100.0, s_vals[idx])), 6)
+                else:
+                    scores_map[c["name"]] = float(c["score"])
+            efforts = self.compute_efforts(
+                list(scores_map.values()), current_vals, comps
+            )
+            return {
+                "strategy": "lp",
+                "results": [
+                    {
+                        "scores": scores_map,
+                        "efforts": efforts,
+                        "feasible": True,
+                        "note": None,
+                    }
+                ],
+            }
+
+        elif strategy == "bruteforce":
+            # brute-force grid search over unknowns
+            m = len(unknowns)
+            if m > 5:
+                return {
+                    "strategy": "bruteforce",
+                    "error": "bruteforce limited to at most 5 unknowns due to complexity",
+                }
+            # construct ranges for each unknown
+            grids = []
+            for u in unknowns:
+                lo = max(0.0, float(u.get("min_score", 0.0)))
+                hi = min(100.0, float(u.get("max_score", 100.0)))
+                # generate values from lo..hi with given step
+                vals = []
+                v = lo
+                while v <= hi + 1e-9:
+                    vals.append(round(v, 6))
+                    v += step
+                grids.append(vals)
+
+            results = []
+            # iterate product
+            for combo in itertools.product(*grids):
+                s_map = {}
+                # fill knowns
+                for c in comps:
+                    if c.get("score") is not None:
+                        s_map[c["name"]] = float(c["score"])
+                # fill unknowns from combo in order
+                for u, val in zip(unknowns, combo):
+                    s_map[u["name"]] = float(val)
+                # compute weighted total
+                total = sum(float(s_map[c["name"]]) * c["weight"] for c in comps)
+                if total + 1e-9 >= float(target):  # meets or exceeds
+                    # compute efforts using current_vals
+                    score_list_in_order = [s_map[c["name"]] for c in comps]
+                    efforts = self.compute_efforts(
+                        score_list_in_order, current_vals, comps
+                    )
+                    results.append(
+                        {
+                            "scores": s_map.copy(),
+                            "efforts": efforts,
+                            "feasible": True,
+                            "total": total,
+                        }
+                    )
+            # sort by effort L1 then Linf then L2
+            results.sort(
+                key=lambda r: (
+                    r["efforts"]["L1"],
+                    r["efforts"]["Linf"],
+                    r["efforts"]["L2"],
+                )
+            )
+            short = results[:max_results]
+            # drop 'total' from results
+            for r in short:
+                r.pop("total", None)
+            return {"strategy": "bruteforce", "results": short}
+        else:
+            return {"error": f"unknown strategy: {strategy}"}

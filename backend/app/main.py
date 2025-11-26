@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app import schemas
 from backend.app.calculations import GradeCalculator
+from backend.app.schemas import CombinationsRequest, CombinationsResponse
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Scholarship Calculator API", version="0.2")
@@ -50,4 +51,57 @@ def required_final(req: schemas.RequiredFinalRequest):
         logger.exception("Error in /required_final: %s", e)
         raise HTTPException(
             status_code=400, detail=f"Error computing required_final: {str(e)}"
+        )
+
+
+@app.post("/combinations", response_model=CombinationsResponse)
+def combinations(req: CombinationsRequest):
+    """
+    Solve for combinations of unknown components to reach target.
+    Supports strategy Linear Programming 'lp' (requires scipy) and 'bruteforce' (grid search).
+    """
+    # Validate strategy
+    valid_strategies = ["lp", "bruteforce"]
+    strategy = req.strategy or "lp"
+    if strategy not in valid_strategies:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid strategy: {strategy}. Must be one of {valid_strategies}",
+        )
+
+    # Validate components not empty
+    if not req.components:
+        raise HTTPException(status_code=400, detail="components list cannot be empty")
+
+    try:
+        result = calc.solve_combinations(
+            components=[c.dict() for c in req.components],
+            target=req.target,
+            strategy=strategy,
+            step=req.step or 1.0,
+            max_results=req.max_results or 20,
+            costs=req.costs,
+            objective=req.objective or "sum",
+        )
+        if isinstance(result, dict) and (
+            "error" in result or result.get("success") is False
+        ):
+            detail = result.get("error") or result.get("reason") or "LP solver failed"
+            raise HTTPException(status_code=400, detail=str(detail))
+        # normalize to response_model shape: results-> list of CombinationResult
+        results = []
+        for r in result.get("results", []):
+            results.append(
+                {
+                    "scores": r.get("scores", {}),
+                    "efforts": r.get("efforts", {}),
+                    "feasible": r.get("feasible", True),
+                    "note": r.get("note"),
+                }
+            )
+        return {"strategy": result.get("strategy", req.strategy), "results": results}
+    except Exception as e:
+        logger.exception("Error in /combinations: %s", e)
+        raise HTTPException(
+            status_code=400, detail=f"Error computing combinations: {str(e)}"
         )
